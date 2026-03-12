@@ -75,48 +75,95 @@ async function sbGetOrCreateUserForAccount(account) {
   return created;
 }
 
-// ── 이름으로 구성원 user 조회/생성 (account 없는 팀원)
-async function sbGetOrCreateMemberByName(name) {
-  const { data } = await supabase
-    .from("users").select("*").eq("name", name).maybeSingle();
-  if (data) return data;
+// ── 팀원 user 신규 생성 (동명이인 허용 — 항상 새 레코드)
+async function sbCreateMemberByName(name) {
   const { data: created, error } = await supabase
     .from("users").insert({ name }).select().single();
   if (error) throw error;
   return created;
 }
 
-// ── 내 프로젝트 목록
-async function sbGetMyProjects(accountId) {
+// ── member_roles 저장
+async function sbSaveMemberRoles(projectId, roleRows) {
+  if (!roleRows.length) return;
+  const { error } = await supabase.from("member_roles").insert(roleRows);
+  if (error) throw error;
+}
+
+// ── member_roles 조회
+async function sbGetMemberRoles(projectId) {
   const { data, error } = await supabase
-    .from("project_members")
+    .from("member_roles").select("*").eq("project_id", projectId);
+  if (error) throw error;
+  return data || [];
+}
+
+// ── member_roles 업데이트 (기존 삭제 후 재삽입)
+async function sbUpdateMemberRoles(projectId, userId, roleRows) {
+  await supabase.from("member_roles")
+    .delete().eq("project_id", projectId).eq("user_id", userId);
+  if (roleRows.length) {
+    const { error } = await supabase.from("member_roles").insert(roleRows);
+    if (error) throw error;
+  }
+}
+
+// ── 내 프로젝트 목록 (2단계 쿼리로 Supabase 중첩 버그 방지)
+async function sbGetMyProjects(accountId) {
+  // 1단계: 내가 속한 project_id 목록
+  const { data: memberRows, error: mErr } = await supabase
+    .from("project_members").select("project_id").eq("account_id", accountId);
+  if (mErr) throw mErr;
+  if (!memberRows || memberRows.length === 0) return [];
+  const projectIds = memberRows.map(r => r.project_id);
+
+  // 2단계: projects → procedures → tasks (2단계 중첩만, 안정적)
+  const { data: projects, error: pErr } = await supabase
+    .from("projects")
     .select(`
-      project_id,
-      projects (
-        id, name, topic, start_date, end_date, owner_account_id, invite_code, created_at,
-        procedures (
-          id, name, icon, color, order_index,
-          tasks ( id, procedure_id, title, member_id, status, note, files )
-        ),
-        project_members (
-          id, user_id, account_id, role,
-          users ( id, name, account_id )
-        )
+      id, name, topic, start_date, end_date, owner_account_id, invite_code, created_at,
+      procedures (
+        id, name, icon, color, order_index,
+        tasks ( id, procedure_id, title, member_id, status, note, files )
+      ),
+      project_members (
+        id, user_id, account_id, role,
+        users ( id, name, account_id )
       )
     `)
-    .eq("account_id", accountId);
-  if (error) throw error;
-  return data.map(d => d.projects).filter(Boolean).map(dbProjectToApp);
+    .in("id", projectIds);
+  if (pErr) throw pErr;
+
+  // 3단계: member_roles 별도 조회
+  const { data: allRoles, error: rErr } = await supabase
+    .from("member_roles").select("*").in("project_id", projectIds);
+  if (rErr) throw rErr;
+
+  return (projects || []).map(p => dbProjectToApp(p, allRoles || []));
 }
 
 // ── DB 구조 → 앱 포맷
-function dbProjectToApp(p) {
-  const members = (p.project_members || []).map(pm => ({
-    id: pm.user_id,
-    accountId: pm.account_id || null,
-    name: pm.users?.name || "",
-    role: pm.role,
-  }));
+function dbProjectToApp(p, allRoles = []) {
+  const projectRoles = allRoles.filter(r => r.project_id === p.id);
+
+  const members = (p.project_members || []).map(pm => {
+    const userRoles = projectRoles.filter(r => r.user_id === pm.user_id);
+    const main = userRoles.find(r => r.role_type === "main");
+    const sub1 = userRoles.find(r => r.role_type === "sub1");
+    const sub2 = userRoles.find(r => r.role_type === "sub2");
+    return {
+      id: pm.user_id,
+      accountId: pm.account_id || null,
+      name: pm.users?.name || "",
+      role: pm.role,
+      memberRoles: {
+        main: main ? { name: main.role_name, icon: main.role_icon, color: main.role_color } : null,
+        sub1: sub1 ? { name: sub1.role_name, icon: sub1.role_icon, color: sub1.role_color } : null,
+        sub2: sub2 ? { name: sub2.role_name, icon: sub2.role_icon, color: sub2.role_color } : null,
+      },
+    };
+  });
+
   const procedures = (p.procedures || [])
     .sort((a, b) => a.order_index - b.order_index)
     .map(proc => ({
@@ -125,17 +172,19 @@ function dbProjectToApp(p) {
       tasks: (proc.tasks || []).map(t => ({
         id: t.id, title: t.title,
         memberId: t.member_id || "",
-        memberName: members.find(m => m.id === t.member_id)?.name || "미할당",
+        memberName: !t.member_id
+          ? "미할당"
+          : members.find(m => m.id === t.member_id)?.name || "미할당",
         status: t.status || "todo", note: t.note || "", files: t.files || [],
       })),
     }));
+
   return {
     id: p.id, name: p.name, topic: p.topic || "",
     startDate: p.start_date || "", endDate: p.end_date || "",
     ownerAccountId: p.owner_account_id || null,
     inviteCode: p.invite_code || null,
     members, procedures,
-    roles: BASE_ROLES.map(r => ({ ...r })),
     createdAt: p.created_at,
   };
 }
@@ -147,7 +196,11 @@ function genInviteCode() {
 }
 
 // ── 프로젝트 생성
+// members: [{ id(uuid), name, account_id?, memberRoles? }]
 async function sbCreateProject({ name, topic, startDate, endDate, ownerAccountId, ownerUserId, members, procedures }) {
+  // members에서 uuid가 아닌 id 제거 (방어 처리)
+  const validMembers = members.filter(m => m.id && m.id !== "self" && m.id.includes("-"));
+
   const inviteCode = genInviteCode();
   const { data: proj, error: pErr } = await supabase
     .from("projects")
@@ -155,7 +208,8 @@ async function sbCreateProject({ name, topic, startDate, endDate, ownerAccountId
     .select().single();
   if (pErr) throw pErr;
 
-  const memberRows = members.map(m => ({
+  // project_members 삽입
+  const memberRows = validMembers.map(m => ({
     project_id: proj.id, user_id: m.id,
     account_id: m.id === ownerUserId ? ownerAccountId : (m.account_id || null),
     role: m.id === ownerUserId ? "owner" : "member",
@@ -166,6 +220,24 @@ async function sbCreateProject({ name, topic, startDate, endDate, ownerAccountId
   const { error: mErr } = await supabase.from("project_members").insert(memberRows);
   if (mErr) throw mErr;
 
+  // member_roles 삽입 (별도 테이블)
+  const roleRows = [];
+  validMembers.forEach(m => {
+    const mr = m.memberRoles || {};
+    [["main", mr.main], ["sub1", mr.sub1], ["sub2", mr.sub2]].forEach(([type, r]) => {
+      if (r?.name) roleRows.push({
+        project_id: proj.id, user_id: m.id,
+        role_type: type, role_name: r.name,
+        role_icon: r.icon || "⭐", role_color: r.color || "#6366f1",
+      });
+    });
+  });
+  if (roleRows.length) {
+    const { error: rErr } = await supabase.from("member_roles").insert(roleRows);
+    if (rErr) throw rErr;
+  }
+
+  // procedures + tasks 삽입
   if (procedures?.length) {
     const procRows = procedures.map((p, i) => ({
       project_id: proj.id, name: p.name,
@@ -179,15 +251,23 @@ async function sbCreateProject({ name, topic, startDate, endDate, ownerAccountId
       const src = procedures[i];
       const custom = src.customTasks || [];
       if (custom.length > 0) {
-        custom.forEach(ct => taskRows.push({
-          project_id: proj.id, procedure_id: proc.id,
-          title: ct.title, member_id: ct.memberId || null, status: "todo", note: "", files: [],
-        }));
+        custom.forEach(ct => {
+          // member_id는 반드시 uuid여야 함 — 빈 문자열/"ALL" 등은 null로 처리
+          const memberId = ct.memberId && ct.memberId.includes("-") ? ct.memberId : null;
+          taskRows.push({
+            project_id: proj.id, procedure_id: proc.id,
+            title: ct.title, member_id: memberId,
+            status: "todo", note: "",
+          });
+        });
       } else {
-        members.forEach(m => taskRows.push({
-          project_id: proj.id, procedure_id: proc.id,
-          title: `${proc.name} — ${m.name}`, member_id: m.id, status: "todo", note: "", files: [],
-        }));
+        validMembers.forEach(m => {
+          taskRows.push({
+            project_id: proj.id, procedure_id: proc.id,
+            title: `${proc.name} — ${m.name}`, member_id: m.id,
+            status: "todo", note: "",
+          });
+        });
       }
     });
     if (taskRows.length) {
@@ -322,7 +402,6 @@ async function sbCreateTask({ projectId, procedureId, title, memberId }) {
       member_id: memberId || null,
       status: "todo",
       note: "",
-      files: [],
     })
     .select()
     .single();
@@ -546,50 +625,72 @@ export default function App() {
     notify("로그아웃 되었습니다.");
   };
 
-  // ── 프로젝트 생성 (중복 이름 체크 + 본인 자동 팀원 추가)
+  // ── 프로젝트 생성 (중복 이름 체크 + 본인 자동 팀원 추가 + 역할 저장)
   const handleCreateProject = async (data) => {
-    if (loading) return; // 중복 제출 방지
+    if (loading) return;
     setLoading(true);
     try {
       const projectName = data.projectName || "새 프로젝트";
 
-      // 동일 이름 프로젝트 중복 체크
       const dupCheck = projects.find(p => p.name.trim() === projectName.trim());
       if (dupCheck) throw new Error(`"${projectName}" 이름의 프로젝트가 이미 존재합니다.`);
 
-      // 팀원 목록 준비
-      // 본인(currentUser)을 제외한 나머지 멤버만 DB에서 조회/생성
-      const rawMembers = (data.members || []).filter(m => m.name !== loginName);
-      const otherUsers = await Promise.all(
-        rawMembers.map(m => sbGetOrCreateMemberByName(m.name))
-      );
+      // 온보딩 멤버: [{ id: "self" | uid(임시), name }]
+      const onboardMembers = data.members || [];
 
-      // 본인은 항상 맨 앞에 한 번만 추가 (이름 기반 중복 제거)
-      const memberUsers = [
-        { ...currentUser, account_id: currentAccount.id },
-        ...otherUsers.filter(u => u.id !== currentUser.id),
-      ];
+      // 본인 제외 나머지 → DB에 신규 생성 (동명이인 허용)
+      const rawOthers = onboardMembers.filter(m => m.id !== "self");
+      const otherUsers = await Promise.all(rawOthers.map(m => sbCreateMemberByName(m.name)));
 
-      await sbCreateProject({
+      // onboard id → DB user 매핑 (순서 보존)
+      const dbUserMap = { "self": { ...currentUser, account_id: currentAccount.id } };
+      rawOthers.forEach((om, i) => { dbUserMap[om.id] = otherUsers[i]; });
+
+      // roles 정보 (BASE_ROLES + 커스텀)
+      const onboardRoles = data.roles || BASE_ROLES.map(r => ({ ...r }));
+      const roleAssignments = data.roleAssignments || {};
+      const roleById = Object.fromEntries(onboardRoles.map(r => [r.id, r]));
+
+      // DB user 목록 + memberRoles 붙이기
+      const memberUsers = onboardMembers
+        .map(om => {
+          const dbUser = dbUserMap[om.id];
+          if (!dbUser) return null;
+          const assign = roleAssignments[om.id] || {};
+          const toRole = rid => rid && roleById[rid]
+            ? { name: roleById[rid].name, icon: roleById[rid].icon, color: roleById[rid].color }
+            : null;
+          return {
+            ...dbUser,
+            memberRoles: {
+              main: toRole(assign.main),
+              sub1: toRole(assign.sub1),
+              sub2: toRole(assign.sub2),
+            },
+          };
+        })
+        .filter(Boolean);
+
+      const created = await sbCreateProject({
         name:           projectName,
         topic:          data.topic || "",
         startDate:      data.startDate || null,
         endDate:        data.endDate || null,
         ownerAccountId: currentAccount.id,
         ownerUserId:    currentUser.id,
-        members:        memberUsers.map(m => ({
-          ...m,
-          accountId: m.id === currentUser.id ? currentAccount.id : (m.account_id || null),
-        })),
-        procedures: data.procedures || [],
+        members:        memberUsers,
+        procedures:     data.procedures || [],
       });
 
       const projs = await sbGetMyProjects(currentAccount.id);
       setProjects(projs);
-      setScreen("projects");
+
+      // 생성된 프로젝트로 바로 진입
+      const newProj = projs.find(p => p.id === created.id);
+      if (newProj) { setActive(newProj); setTab("dashboard"); setScreen("project"); }
+      else setScreen("projects");
       notify("프로젝트가 생성되었습니다! 🎉");
     } catch (e) {
-      // 중복 이름 에러는 notify로 표시
       notify(e.message, "err");
     } finally {
       setLoading(false);
@@ -1457,8 +1558,8 @@ function OStep2({ T, data, setData, loginName }) {
   const add = () => {
     const name = inp.trim();
     if (!name) return;
-    if (name === myName) { setInp(""); return; }
-    if (members.some(m => m.name === name)) { setInp(""); return; }
+    // 본인(self) 재추가만 막음 — 동명이인은 uid로 구별하므로 허용
+    if (name === myName && members.some(m => m.id === "self")) { setInp(""); return; }
     setData(d => ({ ...d, members: [...(d.members || []), { id: uid(), name }] }));
     setInp("");
   };
@@ -2008,29 +2109,52 @@ function SettingsTab({ T, project, isOwner, onUpdateProject, onDeleteProject, on
         padding: "22px 24px", marginBottom: 20 }}>
         <h3 style={{ color: T.text, fontSize: 14, fontWeight: 700, marginBottom: 16 }}>👥 구성원 ({project.members.length}명)</h3>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {project.members.map(m => (
-            <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 10,
-              padding: "10px 14px", background: T.surfaceHover, borderRadius: 10, border: `1px solid ${T.border}` }}>
-              <div style={{ width: 30, height: 30, borderRadius: "50%", background: T.accent,
-                display: "flex", alignItems: "center", justifyContent: "center",
-                color: "#fff", fontSize: 12, fontWeight: 700, flexShrink: 0 }}>
-                {m.name[0]}
+          {project.members.map((m, idx) => {
+            const hasDuplicate = project.members.filter(x => x.name === m.name).length > 1;
+            const avatarColor = `hsl(${(idx * 57 + 200) % 360}, 60%, 52%)`;
+            const mr = m.memberRoles || {};
+            const roleChips = [
+              mr.main ? { label: mr.main.name, icon: mr.main.icon, color: mr.main.color, tag: "메인" } : null,
+              mr.sub1 ? { label: mr.sub1.name, icon: mr.sub1.icon, color: mr.sub1.color, tag: "서브" } : null,
+              mr.sub2 ? { label: mr.sub2.name, icon: mr.sub2.icon, color: mr.sub2.color, tag: "서브" } : null,
+            ].filter(Boolean);
+            return (
+              <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 10,
+                padding: "12px 14px", background: T.surfaceHover, borderRadius: 10, border: `1px solid ${T.border}` }}>
+                <div style={{ width: 32, height: 32, borderRadius: "50%", background: avatarColor, flexShrink: 0,
+                  display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: 13, fontWeight: 700 }}>
+                  {m.name[0]}
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: roleChips.length ? 5 : 0 }}>
+                    <span style={{ color: T.text, fontSize: 13, fontWeight: 700 }}>{m.name}</span>
+                    {hasDuplicate && <span style={{ color: T.warn, fontSize: 10 }}>⚠️ 동명이인</span>}
+                  </div>
+                  {roleChips.length > 0 && (
+                    <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                      {roleChips.map((rc, i) => (
+                        <span key={i} style={{ fontSize: 10, padding: "2px 7px", borderRadius: 100, fontWeight: 700,
+                          background: `${rc.color || T.accent}20`, color: rc.color || T.accent,
+                          border: `1px solid ${rc.color || T.accent}44` }}>
+                          {rc.icon} {rc.tag === "메인" ? "★ " : ""}{rc.label}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 100, fontWeight: 700, flexShrink: 0,
+                  background: m.accountId ? `${T.success}15` : `${T.warn}15`,
+                  color: m.accountId ? T.success : T.warn }}>
+                  {m.accountId ? "✓ 가입됨" : "미가입"}
+                </span>
+                <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 100, fontWeight: 700, flexShrink: 0,
+                  background: m.role === "owner" ? `${T.accent}15` : T.border,
+                  color: m.role === "owner" ? T.accent : T.textSub }}>
+                  {m.role === "owner" ? "오너" : "멤버"}
+                </span>
               </div>
-              <div style={{ flex: 1 }}>
-                <span style={{ color: T.text, fontSize: 13, fontWeight: 600 }}>{m.name}</span>
-              </div>
-              <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 100, fontWeight: 700,
-                background: m.accountId ? `${T.success}15` : `${T.warn}15`,
-                color: m.accountId ? T.success : T.warn }}>
-                {m.accountId ? "✓ 가입됨" : "미가입"}
-              </span>
-              <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 100, fontWeight: 700,
-                background: m.role === "owner" ? `${T.accent}15` : T.border,
-                color: m.role === "owner" ? T.accent : T.textSub }}>
-                {m.role === "owner" ? "오너" : "멤버"}
-              </span>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
